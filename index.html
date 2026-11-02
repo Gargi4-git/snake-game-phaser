@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Koi Snake – Phaser</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a1c1c; color: #cfe8e0;
+    font-family: Verdana, Geneva, sans-serif; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; }
+  #game { line-height: 0; border-radius: 6px; overflow: hidden; box-shadow: 0 0 0 2px #1f4a48; }
+  p { font-size: 13px; margin: 12px 8px 0; text-align: center; max-width: 480px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div id="game"></div>
+<p>Arrow keys or WASD to steer. Space starts, P pauses. Swipe on touch screens.</p>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.80.1/phaser.min.js"></script>
+<script>
+/* ---------- Config ---------- */
+const FONT = "'Bagel Fat One', 'Trebuchet MS', sans-serif";
+const CELL = 24, COLS = 20, ROWS = 20, HUD = 48;
+const W = COLS * CELL, H = ROWS * CELL + HUD;
+const START_DELAY = 140, MIN_DELAY = 60;   // ms per move; smaller = faster
+const GOLD_EVERY = 5, GOLD_LIFE = 6000;    // golden apple after every 5 foods, lasts 6 s
+
+class SnakeScene extends Phaser.Scene {
+  constructor() { super('snake'); }
+
+  create() {
+    this.g = this.add.graphics();
+    this.hudR = this.add.text(W - 22, 11, '', { fontFamily: FONT, fontSize: '20px', color: '#9be7ff' }).setOrigin(1, 0).setDepth(5);
+    this.hud = this.add.text(26, 11, '', { fontFamily: FONT, fontSize: '20px', color: '#ffd6ec' });
+    this.best = this.loadBest();
+    this.msg = this.add.text(W / 2, H / 2 + HUD / 2, '', {
+      fontFamily: FONT, fontSize: '26px', color: '#fff0f8', align: 'center', lineSpacing: 10, stroke: '#7a2cff', strokeThickness: 5
+    }).setOrigin(0.5).setDepth(10);
+
+    // Keyboard: arrows + WASD
+    this.keys = this.input.keyboard.addKeys({
+      up: 'UP', down: 'DOWN', left: 'LEFT', right: 'RIGHT',
+      w: 'W', a: 'A', s: 'S', d: 'D', space: 'SPACE', p: 'P'
+    });
+    this.input.keyboard.on('keydown', (e) => this.onKey(e.code));
+
+    // Swipe support for touch
+    this.input.on('pointerdown', (p) => { this.sx = p.x; this.sy = p.y; });
+    this.input.on('pointerup', (p) => {
+      const dx = p.x - this.sx, dy = p.y - this.sy;
+      if (Math.max(Math.abs(dx), Math.abs(dy)) < 20) { this.onKey('Space'); return; }
+      if (Math.abs(dx) > Math.abs(dy)) this.turn(dx > 0 ? 1 : -1, 0);
+      else this.turn(0, dy > 0 ? 1 : -1);
+    });
+
+    this.reset();
+    this.state = 'menu';
+    this.showMenu();
+  }
+
+  /* ---------- State ---------- */
+  reset() {
+    this.snake = [{ x: 10, y: 10 }, { x: 9, y: 10 }, { x: 8, y: 10 }];
+    this.queue = [];                 // buffered turns so quick key taps aren't lost
+    this.dir = { x: 1, y: 0 };
+    this.score = 0;                  // number of food items eaten
+    this.grow = 0;
+    this.delay = START_DELAY;
+    this.acc = 0;
+    this.clock = 0;
+    this.bonus = null;
+    this.particles = [];
+    this.food = this.freeCell();
+  }
+
+  showMenu() {
+    this.msg.setText('snek ✦\n\npress space to start');
+  }
+
+  onKey(code) {
+    const map = {
+      ArrowUp: [0, -1], KeyW: [0, -1], ArrowDown: [0, 1], KeyS: [0, 1],
+      ArrowLeft: [-1, 0], KeyA: [-1, 0], ArrowRight: [1, 0], KeyD: [1, 0]
+    };
+    if (map[code]) return this.turn(...map[code]);
+    if (code === 'Space') {
+      if (this.state === 'menu' || this.state === 'over') {
+        this.reset(); this.state = 'play'; this.msg.setText('');
+      } else if (this.state === 'paused') { this.state = 'play'; this.msg.setText(''); }
+    }
+    if (code === 'KeyP') {
+      if (this.state === 'play') { this.state = 'paused'; this.msg.setText('paused ☁\n\np or space to resume'); }
+      else if (this.state === 'paused') { this.state = 'play'; this.msg.setText(''); }
+    }
+  }
+
+  turn(x, y) {
+    if (this.state !== 'play') return;
+    const last = this.queue.length ? this.queue[this.queue.length - 1] : this.dir;
+    if (x === -last.x && y === -last.y) return;   // no 180° reversal
+    if (x === last.x && y === last.y) return;
+    if (this.queue.length < 3) this.queue.push({ x, y });
+  }
+
+  freeCell() {
+    let c;
+    do {
+      c = { x: Phaser.Math.Between(0, COLS - 1), y: Phaser.Math.Between(0, ROWS - 1) };
+    } while (
+      this.snake.some(s => s.x === c.x && s.y === c.y) ||
+      (this.food && this.food.x === c.x && this.food.y === c.y) ||
+      (this.bonus && this.bonus.x === c.x && this.bonus.y === c.y)
+    );
+    return c;
+  }
+
+  /* ---------- Game loop ---------- */
+  update(time, delta) {
+    if (this.state === 'play') {
+      this.clock += delta;
+      if (this.bonus && this.clock > this.bonus.expires) this.bonus = null;
+      this.acc += delta;
+      while (this.acc >= this.delay && this.state === 'play') {
+        this.acc -= this.delay;
+        this.step();
+      }
+    }
+    // particles animate even after game over
+    this.particles.forEach(p => { p.x += p.vx * delta; p.y += p.vy * delta; p.life -= delta; });
+    this.particles = this.particles.filter(p => p.life > 0);
+    this.draw(time);
+  }
+
+  step() {
+    if (this.queue.length) this.dir = this.queue.shift();
+    const head = { x: this.snake[0].x + this.dir.x, y: this.snake[0].y + this.dir.y };
+
+    // Rule 4a: wall collision
+    if (head.x < 0 || head.x >= COLS || head.y < 0 || head.y >= ROWS) return this.gameOver();
+
+    const eatsFood = head.x === this.food.x && head.y === this.food.y;
+    const eatsGold = this.bonus && head.x === this.bonus.x && head.y === this.bonus.y;
+    const willGrow = eatsFood || eatsGold || this.grow > 0;
+
+    // Rule 4b: self collision (the tail cell frees up if we are not growing)
+    const body = willGrow ? this.snake : this.snake.slice(0, -1);
+    if (body.some(s => s.x === head.x && s.y === head.y)) return this.gameOver();
+
+    this.snake.unshift(head);
+    if (this.grow > 0) this.grow--;
+    if (!willGrow) this.trail(this.snake.pop());
+
+    if (eatsFood) {                       // Rules 2, 3, 5
+      this.score++;
+      this.burst(head, 0xff5fa2);
+      this.food = this.freeCell();
+      this.delay = Math.max(MIN_DELAY, this.delay - 3);
+      if (this.score % GOLD_EVERY === 0) {
+        const c = this.freeCell();
+        this.bonus = { x: c.x, y: c.y, expires: this.clock + GOLD_LIFE };
+      }
+    } else if (eatsGold) {                // creative extra: golden apple = eaten + 3 extra growth
+      this.score++;
+      this.grow += 3;
+      this.burst(head, 0xffe66d, 22);
+      this.bonus = null;
+    }
+  }
+
+  gameOver() {
+    this.state = 'over';
+    this.cameras.main.shake(250, 0.012);
+    this.burst(this.snake[0], 0xb388ff, 26);
+    if (this.score > this.best) { this.best = this.score; this.saveBest(); }
+    this.msg.setText(`game over 💀\n\nyou ate ${this.score} ✦   best ${this.best}\n\nspace to run it back`);
+  }
+
+  burst(cell, color, n = 12) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, s = 0.03 + Math.random() * 0.08;
+      this.particles.push({
+        x: cell.x * CELL + CELL / 2, y: HUD + cell.y * CELL + CELL / 2,
+        vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 400 + Math.random() * 300, size: 3 + Math.random() * 3, color
+      });
+    }
+  }
+
+  /* ---------- Rendering ---------- */
+  trail(t) {
+    this.particles.push({ x: t.x * CELL + CELL / 2, y: HUD + t.y * CELL + CELL / 2,
+      vx: 0, vy: -0.012, life: 380, size: 3, color: 0x9be7ff });
+  }
+
+  sparkle(g, x, y, r, color, a) {
+    const k = r * 0.28;
+    g.fillStyle(color, a).fillPoints([
+      { x, y: y - r }, { x: x + k, y: y - k }, { x: x + r, y }, { x: x + k, y: y + k },
+      { x, y: y + r }, { x: x - k, y: y + k }, { x: x - r, y }, { x: x - k, y: y - k }], true);
+  }
+
+  heart(g, x, y, r, color) {
+    g.fillStyle(color, 1)
+      .fillCircle(x - r * 0.5, y - r * 0.3, r * 0.56).fillCircle(x + r * 0.5, y - r * 0.3, r * 0.56)
+      .fillTriangle(x - r * 1.03, y - r * 0.05, x + r * 1.03, y - r * 0.05, x, y + r * 1.05);
+  }
+
+  draw(time) {
+    const g = this.g;
+    g.clear();
+
+    // Backdrop + HUD pills
+    g.fillGradientStyle(0x1d0f40, 0x1d0f40, 0x2a1458, 0x2a1458, 1).fillRect(0, 0, W, H);
+    g.fillStyle(0xffffff, 0.09).fillRoundedRect(10, 6, 120, 36, 18)
+      .fillRoundedRect(W - 130, 6, 120, 36, 18);
+    this.hud.setText(`✦ ${this.score}`);
+    this.hudR.setText(`♛ ${this.best}`);
+
+    // Soft checker board with inner glow edge
+    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+      g.fillStyle((x + y) % 2 ? 0x2a1656 : 0x241249, 1).fillRect(x * CELL, HUD + y * CELL, CELL, CELL);
+    }
+    g.lineStyle(4, 0xb388ff, 0.35).strokeRect(2, HUD + 2, W - 4, ROWS * CELL - 4);
+
+    // Heart food with pulsing glow
+    const fx = this.food.x * CELL + CELL / 2, fy = HUD + this.food.y * CELL + CELL / 2;
+    const pulse = 1 + 0.1 * Math.sin(time / 180);
+    g.fillStyle(0xff5fa2, 0.10).fillCircle(fx, fy, CELL * 0.95 * pulse);
+    g.fillStyle(0xff5fa2, 0.16).fillCircle(fx, fy, CELL * 0.65 * pulse);
+    this.heart(g, fx, fy, CELL * 0.34 * pulse, 0xff4d8d);
+    this.sparkle(g, fx - 4, fy - 4, 2.5, 0xffffff, 0.9);
+
+    // Golden star bonus with countdown ring
+    if (this.bonus) {
+      const bx = this.bonus.x * CELL + CELL / 2, by = HUD + this.bonus.y * CELL + CELL / 2;
+      const sp = 1 + 0.15 * Math.sin(time / 110);
+      g.fillStyle(0xffe66d, 0.18).fillCircle(bx, by, CELL * 0.8);
+      this.sparkle(g, bx, by, CELL * 0.52 * sp, 0xffe66d, 1);
+      const left = Math.max(0, (this.bonus.expires - this.clock) / GOLD_LIFE);
+      g.lineStyle(2, 0xffe66d, 0.8).beginPath()
+        .arc(bx, by, CELL * 0.62, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * left).strokePath();
+    }
+
+    // Snake: hot pink head -> lavender -> aqua tail, with neon glow
+    const n = this.snake.length, dead = this.state === 'over';
+    const C = (r, gg, b) => new Phaser.Display.Color(r, gg, b);
+    const cols = [C(255, 95, 162), C(179, 136, 255), C(94, 242, 230)];
+    for (let i = n - 1; i >= 0; i--) {
+      const t = n > 1 ? i / (n - 1) : 0;
+      const seg = t < 0.5 ? [cols[0], cols[1], t * 2] : [cols[1], cols[2], (t - 0.5) * 2];
+      const c = Phaser.Display.Color.Interpolate.ColorWithColor(seg[0], seg[1], 100, seg[2] * 100);
+      const col = Phaser.Display.Color.GetColor(c.r, c.g, c.b);
+      const sx = this.snake[i].x * CELL, sy = HUD + this.snake[i].y * CELL;
+      g.fillStyle(col, dead ? 0.06 : 0.16).fillRoundedRect(sx - 3, sy - 3, CELL + 6, CELL + 6, 12);
+      const inset = i === 0 ? 1 : 2;
+      g.fillStyle(col, dead ? 0.55 : 1).fillRoundedRect(sx + inset, sy + inset, CELL - inset * 2, CELL - inset * 2, 9);
+      if (i > 0) g.fillStyle(0xffffff, 0.22).fillCircle(sx + 8, sy + 8, 2.5);
+    }
+    // Big cute eyes with highlights
+    const h = this.snake[0], ex = h.x * CELL + CELL / 2, ey = HUD + h.y * CELL + CELL / 2;
+    const d = this.dir, px = -d.y * 5.2, py = d.x * 5.2;
+    [1, -1].forEach(k => {
+      const x = ex + d.x * 3 + px * k, y = ey + d.y * 3 + py * k;
+      g.fillStyle(0xffffff, 1).fillCircle(x, y, 3.8);
+      g.fillStyle(0x2a1458, 1).fillCircle(x + d.x * 1.2, y + d.y * 1.2, 2.2);
+      g.fillStyle(0xffffff, 1).fillCircle(x + d.x * 1.2 - 0.7, y + d.y * 1.2 - 0.7, 0.8);
+    });
+
+    // Sparkle particles
+    this.particles.forEach(p => this.sparkle(g, p.x, p.y, p.size, p.color, Math.min(1, p.life / 250)));
+
+    // Dim + rounded message card for menu / pause / game over
+    if (this.state !== 'play') {
+      g.fillStyle(0x0d0620, 0.6).fillRect(0, HUD, W, H - HUD);
+      g.fillStyle(0x1d0f40, 0.92).fillRoundedRect(40, HUD + 130, W - 80, 200, 30);
+      g.lineStyle(3, 0xff5fa2, 1).strokeRoundedRect(40, HUD + 130, W - 80, 200, 30);
+    }
+  }
+
+  /* ---------- High score (kept in the browser) ---------- */
+  loadBest() { try { return +localStorage.getItem('koiSnakeBest') || 0; } catch (e) { return 0; } }
+  saveBest() { try { localStorage.setItem('koiSnakeBest', this.best); } catch (e) {} }
+}
+
+function startGame() { new Phaser.Game({
+  type: Phaser.AUTO,
+  parent: 'game',
+  width: W,
+  height: H,
+  backgroundColor: '#150b30',
+  scene: SnakeScene,
+  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_HORIZONTALLY }
+}); }
+// wait for the display font so canvas text renders with it
+document.fonts.load('20px "Bagel Fat One"').then(startGame, startGame);
+</script>
+</body>
+</html>
